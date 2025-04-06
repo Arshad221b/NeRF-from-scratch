@@ -8,7 +8,7 @@ class NeRF(nn.Module):
     def __init__(self): 
         super(NeRF, self).__init__()
         self.layers = nn.Sequential(
-            nn.Linear(3, 256),
+            nn.Linear(63, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
