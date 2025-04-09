@@ -7,8 +7,6 @@ from PIL import Image
 
 class LoadSyntheticDataset(Dataset): 
     def __init__(self, path_to_images, path_to_labels): 
-        print(f"Initializing dataset with images path: {path_to_images}")
-        print(f"Labels path: {path_to_labels}")
         
         if not os.path.exists(path_to_images):
             raise FileNotFoundError(f"Images directory not found: {path_to_images}")
@@ -17,20 +15,15 @@ class LoadSyntheticDataset(Dataset):
             raise FileNotFoundError(f"Labels file not found: {path_to_labels}")
             
         self.path_to_images = path_to_images
-        print(f"Contents of {path_to_images}:")
         all_files = os.listdir(path_to_images)
-        print(f"All files: {all_files}")
         self.images = [im for im in all_files if im.endswith('.png')]
-        print(f"Found {len(self.images)} PNG images: {self.images}")
         
         self.transform = transforms.ToTensor()
         
         try:
             with open(path_to_labels, 'r') as f: 
                 self.labels = json.load(f)
-            print(f"Loaded {len(self.labels['frames'])} frames from labels file")
         except Exception as e:
-            print(f"Error loading labels file: {str(e)}")
             raise
 
     def get_origins_and_directions(self, frame, width, height): 
@@ -90,27 +83,50 @@ class LoadSyntheticDataset(Dataset):
             if not os.path.exists(img_path):
                 raise FileNotFoundError(f"Image file not found: {img_path}")
                 
-            image = Image.open(img_path).convert("RGB")
+            image = Image.open(img_path).convert("RGB") 
 
             if self.transform: 
                 image = self.transform(image)
-            print(f'Processing image {idx}: shape {image.shape}')
 
-            N_rays = 1024
+            N_rays = 4096
             H, W = image.shape[1], image.shape[2]
-            origins, directions = self.get_origins_and_directions(label, W, H)
-            origins, directions = self.sample_random_rays(origins, directions, N_rays)
+            focal = 0.5 * W
 
-            points, z_vals = self.get_rays_sampling(origins, directions, 2, 6, 64)
-            image = image.reshape(H * W, 3)
-            _, indices = torch.sort(torch.randperm(H*W)[:N_rays])  # reuse same indices
-            rgb_gt = image[indices]  # [N_rays, 3]
+            i, j = torch.meshgrid(torch.arange(W), torch.arange(H), indexing='xy')
+            i = i.reshape(-1)
+            j = j.reshape(-1)
+
+            indices = torch.randint(0, H * W, (N_rays,))
+            i = i[indices]
+            j = j[indices]
+            rgb_gt = image[:, j, i].permute(1, 0)  # [N_rays, 3]
+
+            x = (i - W * 0.5) / focal
+            y = (j - H * 0.5) / focal
+            z = -torch.ones_like(x)
+            dirs = torch.stack([x, y, z], dim=-1)  # [N_rays, 3]
+
+            c2w = torch.tensor(label['transform_matrix'], dtype=torch.float32)  # [4, 4]
+            rays_d = (dirs @ c2w[:3, :3].T).float()  # Rotate ray directions
+            rays_o = c2w[:3, 3].expand(rays_d.shape)  # [N_rays, 3]
+
+            near, far = 2.0, 6.0
+            t_vals = torch.linspace(0., 1., steps=64)
+            z_vals = near * (1. - t_vals) + far * t_vals  # [64]
+            z_vals = z_vals.expand(N_rays, -1)
+
+            mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            upper = torch.cat([mids, z_vals[..., -1:]], -1)
+            lower = torch.cat([z_vals[..., :1], mids], -1)
+            z_vals = lower + (upper - lower) * torch.rand_like(z_vals)
+
+            points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # [N_rays, 64, 3]
 
             return {
                 'points': points,
-                'rays_d': directions,
+                'rays_d': rays_d,
                 'rgb_gt': rgb_gt,
-                'z_vals': z_vals.T.expand(origins.shape[0], -1)  
+                'z_vals': z_vals
             }
         except Exception as e:
             print(f"Error processing item {idx}: {str(e)}")
@@ -120,9 +136,6 @@ class LoadSyntheticDataset(Dataset):
 
 class CustomDataloader: 
     def __init__(self, batch_size, path_to_images=None, path_to_labels=None): 
-        print(f"Initializing CustomDataloader with batch_size={batch_size}")
-        print(f"path_to_images={path_to_images}")
-        print(f"path_to_labels={path_to_labels}")
         
         if path_to_images is None or path_to_labels is None:
             raise ValueError("Both path_to_images and path_to_labels must be provided")
@@ -133,7 +146,6 @@ class CustomDataloader:
             )
         self.batch_size = batch_size
         self.loader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
-        print(f"Created DataLoader with {len(self.loader)} batches")
     
     def __iter__(self):
         return iter(self.loader)

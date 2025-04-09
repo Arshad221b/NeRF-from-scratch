@@ -14,7 +14,7 @@ class NeRF(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 4)
+            nn.Linear(256, 5)
         )
 
     def forward(self, x):  

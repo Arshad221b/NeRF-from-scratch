@@ -1,7 +1,6 @@
 import os
 import sys
 
-# Add the parent directory to the path so imports work correctly
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from source.model import NeRFModel
@@ -27,7 +26,7 @@ class TrainModel:
         transforms_path = os.path.join(base_path, 'transforms_train.json')
         
         self.dataloader = CustomDataloader(self.batch_size, data_path, transforms_path)
-        self.epochs = 2
+        self.epochs = 1000
         
         self.loss_function = nn.MSELoss()
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.1)
@@ -35,80 +34,32 @@ class TrainModel:
         self.checkpoint_path = 'checkpoint.pth'
 
     #ChatGPT Generated Function
-    def volume_rendering(self, outputs, z_vals, dirs):
-        
-        rgb = outputs[..., :3]  # [N_rays, N_samples, 3]
-        sigma = outputs[..., 3]  # [N_rays, N_samples]
-        # # print(f"rgb shape: {rgb.shape}")
-        # # print(f"sigma shape: {sigma.shape}")
+    def volume_rendering(self, outputs, z_vals, rays_d):
+        rgb = outputs[..., :3]                  # [B, N, 3]
+        sigma = outputs[..., 3]                 # [B, N]
+        sigma = torch.clamp(sigma, min=0.0, max=10.0)
+        # Compute distances between z samples
+        dists = z_vals[..., 1:] - z_vals[..., :-1]  # [B, N-1]
+        last_dist = 1e10 * torch.ones_like(dists[..., :1])  # [B, 1]
+        dists = torch.cat([dists, last_dist], dim=-1)       # [B, N]
 
-        # Compute distances between adjacent samples
-        dists = z_vals[:, 1:] - z_vals[:, :-1]  # [N_rays, N_samples - 1]
-        # print(f"dists shape before unsqueeze: {dists.shape}")
-        dists = dists.unsqueeze(-1)  # [N_rays, N_samples - 1, 1]
-        # print(f"dists shape after unsqueeze: {dists.shape}")
-        
-        # Create padding with correct size [N_rays, 1, 1]
-        padding = 1e10 * torch.ones_like(dists[:, :1, :])  # Using same device and dtype as dists
-        # print(f"padding shape: {padding.shape}")
-        dists = torch.cat([dists, padding], dim=1)  # [N_rays, N_samples, 1]
-        # print(f"dists shape after cat: {dists.shape}")
+        # Scale by ray direction magnitude
+        dists = dists * torch.norm(rays_d[..., None, :], dim=-1)  # [B, N]
 
-        # Scale distances by ray direction magnitude
-        # Compute ray direction norms with correct broadcasting
-        ray_dirs_norm = torch.norm(dirs, dim=-1, keepdim=True)  # [N_rays, 1]
-        # print(f"ray_dirs_norm shape before unsqueeze: {ray_dirs_norm.shape}")
-        
-        # Reshape ray_dirs_norm to match dists shape
-        # The issue is that ray_dirs_norm has shape [N_rays, 1] but we need [N_rays, 1, 1]
-        # and we need to make sure the N_rays dimension matches
-        if ray_dirs_norm.shape[0] != dists.shape[0]:
-            # If the number of rays doesn't match, we need to expand ray_dirs_norm
-            ray_dirs_norm = ray_dirs_norm[:dists.shape[0]]
-        
-        ray_dirs_norm = ray_dirs_norm.unsqueeze(1)  # [N_rays, 1, 1]
-        # print(f"ray_dirs_norm shape after unsqueeze: {ray_dirs_norm.shape}")
-        
-        # Make sure ray_dirs_norm has the right shape for broadcasting
-        if ray_dirs_norm.shape[0] != dists.shape[0]:
-            # If the number of rays still doesn't match, we need to expand ray_dirs_norm
-            ray_dirs_norm = ray_dirs_norm.expand(dists.shape[0], 1, 1)
-            # print(f"ray_dirs_norm shape after expand: {ray_dirs_norm.shape}")
-        
-        # The issue is that dists has shape [N_rays, N_samples, 1] but ray_dirs_norm has shape [N_rays, 1, 1]
-        # We need to make sure the N_samples dimension is compatible
-        if dists.shape[1] != ray_dirs_norm.shape[1]:
-            # If the N_samples dimension doesn't match, we need to expand ray_dirs_norm
-            ray_dirs_norm = ray_dirs_norm.expand(-1, dists.shape[1], -1)
-            # print(f"ray_dirs_norm shape after final expand: {ray_dirs_norm.shape}")
-        
-        dists = dists * ray_dirs_norm  # [N_rays, N_samples, 1]
-        # print(f"dists shape after multiplication: {dists.shape}")
+        # Volume rendering steps
+        alpha = 1.0 - torch.exp(-sigma * dists)  # [B, N]
+        transmittance = torch.cumprod(
+            torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
+            dim=-1
+        )[..., :-1]
+        weights = alpha * transmittance  # [B, N]
 
-        # Compute alpha values from densities
-        alpha = 1.0 - torch.exp(-sigma.unsqueeze(-1) * dists)  # [N_rays, N_samples, 1]
-        # print(f"alpha shape: {alpha.shape}")
+        # RGB + Depth
+        rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)  # [B, 3]
+        depth_map = torch.sum(weights * z_vals, dim=-1)        # [B]
 
-        # Compute transmittance
-        ones = torch.ones((alpha.shape[0], 1, 1), device=alpha.device)
-        # print(f"ones shape: {ones.shape}")
-        alpha_cat = torch.cat([ones, 1. - alpha + 1e-10], dim=1)
-        # print(f"alpha_cat shape: {alpha_cat.shape}")
-        accum_prod = torch.cumprod(alpha_cat, dim=1)
-        # print(f"accum_prod shape: {accum_prod.shape}")
-        T = accum_prod[:, :-1, :]  # [N_rays, N_samples, 1]
-        # print(f"T shape: {T.shape}")
-
-        # Compute final weights
-        weights = T * alpha  # [N_rays, N_samples, 1]
-        # print(f"weights shape: {weights.shape}")
-
-        # Weighted sum of colors
-        rgb_final = torch.sum(weights * rgb, dim=1)  # [N_rays, 3]
-        # print(f"rgb_final shape: {rgb_final.shape}")
-
-        return rgb_final
-
+        return rgb_map, depth_map
+    
     def train(self):
         try:
             torch.cuda.empty_cache()
@@ -116,9 +67,8 @@ class TrainModel:
                 for i, data in enumerate(self.dataloader):
                     try:
                         for key, value in data.items():
-                            if isinstance(value, torch.Tensor):
-                                print(f"  {key}: {value.shape}")
-                        
+                            data[key] = value.to(self.device)
+
                         points = data['points'].to(self.device)
                         rays_d = data['rays_d'].to(self.device)
                         z_vals = data['z_vals'].to(self.device)
@@ -142,9 +92,11 @@ class TrainModel:
                         
                         self.optimizer.zero_grad()
                         outputs = self.model(points)
-                        rgb_pred = self.volume_rendering(outputs, z_vals, rays_d)
+                        
+                        rgb_pred, depth_pred = self.volume_rendering(outputs, z_vals, rays_d)
                         loss = self.loss_function(rgb_pred, rgb_gt)
                         loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
 
                         if i % 100 == 0:
