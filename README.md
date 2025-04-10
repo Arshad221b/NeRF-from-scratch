@@ -1,5 +1,7 @@
 # NeRF from Scratch
 
+![NeRF Rendering](screenshot/nerf.png)
+
 A PyTorch implementation of Neural Radiance Fields (NeRF) built from scratch. This implementation focuses on learning and understanding the core concepts of NeRF while maintaining good performance and code readability.
 
 ## Overview
