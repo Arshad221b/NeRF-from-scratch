@@ -54,83 +54,140 @@ def render_novel_view(model, c2w, H=400, W=400, focal=None, device='cuda'):
     """Render a novel view from the given camera pose."""
     model.eval()
     if focal is None:
-        focal = W / 2  # Default focal length
+        focal = W / 2
         
     with torch.no_grad():
-        rays_o, rays_d = get_rays(H, W, focal, c2w, device=device)  # [H, W, 3]
+        rays_o, rays_d = get_rays(H, W, focal, c2w, device=device)
         
         # Flatten rays for processing
-        rays_o = rays_o.reshape(-1, 3)  # [H*W, 3]
-        rays_d = rays_d.reshape(-1, 3)  # [H*W, 3]
+        rays_o = rays_o.reshape(-1, 3)
+        rays_d = rays_d.reshape(-1, 3)
         
-        # Sample points along rays
-        near, far = 2.0, 6.0
-        t_vals = torch.linspace(0., 1., steps=64, device=device)
-        z_vals = near * (1. - t_vals) + far * t_vals  # [64]
-        z_vals = z_vals.expand(rays_o.shape[0], -1)  # [H*W, 64]
+        # Process rays in chunks to save memory
+        chunk_size = 4096
+        rgb_final = torch.zeros((H*W, 3), device=device)
         
-        # Get sample points
-        points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # [H*W, 64, 3]
-        points_flat = points.reshape(-1, 3)  # [H*W*64, 3]
-        
-        # Process in chunks to avoid OOM
-        chunk_size = 32768
-        outputs = []
-        
-        for i in range(0, points_flat.shape[0], chunk_size):
-            points_chunk = points_flat[i:i+chunk_size]
-            # The model will handle positional encoding internally
-            output_chunk = model(points_chunk)  # [chunk_size, 5]
-            outputs.append(output_chunk)
+        for chunk_start in range(0, rays_o.shape[0], chunk_size):
+            chunk_end = min(chunk_start + chunk_size, rays_o.shape[0])
             
-        outputs = torch.cat(outputs, 0)  # [H*W*64, 5]
+            rays_o_chunk = rays_o[chunk_start:chunk_end]
+            rays_d_chunk = rays_d[chunk_start:chunk_end]
+            rays_d_chunk = F.normalize(rays_d_chunk, p=2, dim=-1)
+            
+            # Sampling strategy from training
+            near, far = 2.0, 6.0
+            t_vals = torch.linspace(0., 1., steps=64, device=device)
+            z_vals = near * (1. - t_vals) + far * t_vals
+            z_vals = z_vals.expand(rays_o_chunk.shape[0], -1)
+            
+            # Add stratified sampling
+            mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            upper = torch.cat([mids, z_vals[..., -1:]], dim=-1)
+            lower = torch.cat([z_vals[..., :1], mids], dim=-1)
+            t_rand = torch.rand(z_vals.shape, device=device)
+            z_vals = lower + (upper - lower) * t_rand
+            
+            # Get sample points
+            points = rays_o_chunk[:, None, :] + rays_d_chunk[:, None, :] * z_vals[..., :, None]
+            view_dirs = rays_d_chunk[:, None, :].expand_as(points)
+            
+            # Flatten points and directions
+            points_flat = points.reshape(-1, 3)
+            dirs_flat = view_dirs.reshape(-1, 3)
+            
+            # Process in smaller sub-chunks
+            sub_chunk_size = 8192
+            outputs_chunks = []
+            
+            for i in range(0, points_flat.shape[0], sub_chunk_size):
+                points_sub = points_flat[i:i+sub_chunk_size]
+                dirs_sub = dirs_flat[i:i+sub_chunk_size]
+                outputs_sub = model(points_sub, dirs_sub)
+                outputs_chunks.append(outputs_sub)
+                torch.cuda.empty_cache()
+            
+            outputs = torch.cat(outputs_chunks, 0)
+            outputs = outputs.reshape(points.shape[0], points.shape[1], 4)
+            
+            # Split outputs
+            rgb = outputs[..., :3]  # [chunk_size, N_samples, 3]
+            sigma = outputs[..., 3]  # [chunk_size, N_samples]
+            
+            # Use same density scaling as training
+            sigma = sigma * 0.1
+            
+            # Compute distances
+            dists = z_vals[..., 1:] - z_vals[..., :-1]  # [chunk_size, N_samples-1]
+            dists = torch.cat([dists, torch.ones_like(dists[..., :1]) * 1e10], dim=-1)  # [chunk_size, N_samples]
+            
+            # Compute alpha compositing
+            alpha = 1.0 - torch.exp(-F.relu(sigma) * dists)  # [chunk_size, N_samples]
+            
+            # Compute weights
+            T = torch.ones_like(alpha[:, :1])  # [chunk_size, 1]
+            weights = []
+            
+            for i in range(alpha.shape[1]):
+                weights.append(T * alpha[:, i:i+1])
+                T = T * (1.0 - alpha[:, i:i+1] + 1e-10)
+            
+            weights = torch.cat(weights, dim=1)  # [chunk_size, N_samples]
+            
+            # Compute final RGB
+            rgb_chunk = (weights.unsqueeze(-1) * rgb).sum(dim=1)  # [chunk_size, 3]
+            rgb_final[chunk_start:chunk_end] = rgb_chunk
+            
+            # Clear memory
+            del points, view_dirs, outputs, rgb, sigma, weights
+            torch.cuda.empty_cache()
         
-        # Split into RGB and sigma
-        rgb_map = torch.sigmoid(outputs[..., :3])  # [H*W*64, 3]
-        sigma_map = outputs[..., 3:4]  # [H*W*64, 1]
-        
-        # Reshape back to [H*W, 64, 3] and [H*W, 64, 1]
-        num_rays = H * W
-        rgb_map = rgb_map.reshape(num_rays, 64, 3)  # [H*W, 64, 3]
-        sigma_map = sigma_map.reshape(num_rays, 64, 1)  # [H*W, 64, 1]
-        
-        # Apply volume rendering equation
-        delta_dists = z_vals[:, 1:] - z_vals[:, :-1]  # [H*W, 63]
-        delta_dists = torch.cat([delta_dists, torch.ones_like(delta_dists[:, :1]) * 1e10], dim=-1)  # [H*W, 64]
-        delta_dists = delta_dists.unsqueeze(-1)  # [H*W, 64, 1]
-        
-        # Alpha compositing
-        alpha = 1.0 - torch.exp(-F.relu(sigma_map) * delta_dists)  # [H*W, 64, 1]
-        T = torch.cumprod(
-            torch.cat([torch.ones((num_rays, 1, 1), device=device), 1.0 - alpha + 1e-10], dim=1)[:, :-1, :],
-            dim=1)  # [H*W, 64, 1]
-        weights = alpha * T  # [H*W, 64, 1]
-        
-        # Compute final color
-        rgb_final = (weights * rgb_map).sum(dim=1)  # [H*W, 3]
-        
-        # Reshape to image dimensions
+        # Reshape and post-process
         rgb_final = rgb_final.reshape(H, W, 3)
+        rgb_final = torch.clamp(rgb_final, 0.0, 1.0)
         
         return rgb_final
 
-def create_360_degree_poses(num_frames=120):
+def create_360_degree_poses(num_frames=120, radius=4.0, h=0.5):
     """Create camera poses for a 360-degree rotation around the object."""
     poses = []
     for th in np.linspace(0., 360., num_frames, endpoint=False):
-        # Convert angle to radians
         theta = np.deg2rad(th)
         
-        # Create rotation matrix
-        c2w = np.array([
-            [np.cos(theta), 0, -np.sin(theta), 0],
-            [0, 1, 0, 0],
-            [np.sin(theta), 0, np.cos(theta), 2],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
+        # Spiral path
+        phi = np.deg2rad(30.0)  # Tilt angle
+        
+        # Camera position
+        x = radius * np.cos(theta) * np.cos(phi)
+        y = h + radius * np.sin(phi)  # Slight elevation
+        z = radius * np.sin(theta) * np.cos(phi)
+        
+        # Look-at point (slightly above origin)
+        target = np.array([0, 0.2, 0])  # Look slightly above center
+        eye = np.array([x, y, z])
+        up = np.array([0, 1, 0])
+        
+        # Create camera-to-world matrix
+        c2w = look_at(eye, target, up)
+        c2w = np.vstack([c2w, np.array([0, 0, 0, 1])])
         
         poses.append({'transform_matrix': c2w})
     return poses
+
+def look_at(eye, target, up):
+    """Create a look-at matrix."""
+    forward = target - eye
+    forward = forward / np.linalg.norm(forward)
+    
+    right = np.cross(forward, up)
+    right = right / np.linalg.norm(right)
+    
+    up = np.cross(right, forward)
+    up = up / np.linalg.norm(up)
+    
+    rot = np.stack([right, up, -forward], axis=1)
+    trans = eye
+    
+    return np.column_stack([rot, trans])
 
 def create_gif(image_folder, output_path, duration=0.1):
     """Create a GIF from a folder of images."""
@@ -146,46 +203,61 @@ def create_gif(image_folder, output_path, duration=0.1):
     imageio.mimsave(output_path, images, duration=duration)
     print(f"GIF saved to {output_path}")
 
+def load_test_poses(transforms_path):
+    """Load test poses from transforms.json file."""
+    with open(transforms_path, 'r') as f:
+        transforms = json.load(f)
+    
+    frames = []
+    camera_angle_x = transforms.get('camera_angle_x', None)
+    
+    for frame in transforms.get('frames', []):
+        frames.append({
+            'transform_matrix': np.array(frame['transform_matrix'], dtype=np.float32),
+            'file_path': frame.get('file_path', None)
+        })
+    
+    return frames, camera_angle_x
+
 def main():
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Initialize model
-    model = NeRFModel(num_freqs=10).to(device)
+    model = NeRFModel(pos_freqs=10, dir_freqs=4).to(device)
     
     # Load checkpoint
-    checkpoint_path = 'checkpoint.pth'
+    checkpoint_path = '/teamspace/studios/this_studio/checkpoint_epoch_200.pth'
     model = load_checkpoint(model, checkpoint_path)
     
     # Create output directory
     render_dir = 'rendered_views'
     os.makedirs(render_dir, exist_ok=True)
     
-    # Generate 360-degree camera poses
-    frames = create_360_degree_poses(num_frames=120)  # 120 frames for smooth rotation
+    # Load test transforms
+    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    transforms_path = os.path.join(workspace_root, 'nerf_synthetic', 'chair', 'transforms_test.json')
+    frames, camera_angle_x = load_test_poses(transforms_path)
     
-    print("Rendering 360-degree views...")
-    # Render novel views
+    # Calculate focal length from camera angle
+    H = W = 400  # Match training resolution
+    focal = W / (2 * np.tan(camera_angle_x / 2))
+    
+    print(f"Rendering {len(frames)} test views...")
     for idx, frame in enumerate(frames):
         print(f"Rendering view {idx + 1}/{len(frames)}")
         
-        # Get camera-to-world transform and move to device
         c2w = torch.tensor(frame['transform_matrix'], dtype=torch.float32, device=device)
         
-        # Render
-        rgb_map = render_novel_view(model, c2w, device=device)
+        # Render using the correct focal length
+        rgb_map = render_novel_view(model, c2w, H=H, W=W, focal=focal, device=device)
         
-        # Move to CPU for saving
         rgb_map = rgb_map.cpu()
-        
-        # Save rendered image
         output_path = os.path.join(render_dir, f'view_{idx:03d}.png')
         save_rendered_image(rgb_map, rgb_map.shape[1], rgb_map.shape[0], output_path)
     
-    # Create GIF from rendered views
     print("Creating GIF from rendered views...")
-    create_gif(render_dir, 'nerf_360_rotation.gif', duration=0.05)  # 0.05s per frame = 20fps
-    print("Done! Check nerf_360_rotation.gif for the final animation.")
+    create_gif(render_dir, 'nerf_test_views.gif', duration=0.1)
+    print("Done! Check nerf_test_views.gif for the final animation.")
 
 if __name__ == '__main__':
     main() 

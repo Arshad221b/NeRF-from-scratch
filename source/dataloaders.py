@@ -4,6 +4,7 @@ import torch
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+import numpy as np
 
 class LoadSyntheticDataset(Dataset): 
     def __init__(self, path_to_images, path_to_labels): 
@@ -23,6 +24,7 @@ class LoadSyntheticDataset(Dataset):
         try:
             with open(path_to_labels, 'r') as f: 
                 self.labels = json.load(f)
+            self.camera_angle_x = self.labels.get('camera_angle_x', None)
         except Exception as e:
             raise
 
@@ -76,7 +78,6 @@ class LoadSyntheticDataset(Dataset):
     def __getitem__ (self, idx): 
         try:
             label = self.labels['frames'][idx]
-            # Get just the filename from the file_path, removing any directory components
             file_name = os.path.basename(label['file_path']) + '.png'
             img_path = os.path.join(self.path_to_images, file_name)
             
@@ -90,19 +91,19 @@ class LoadSyntheticDataset(Dataset):
 
             N_rays = 4096
             H, W = image.shape[1], image.shape[2]
-            focal = 0.5 * W
+            
+            if self.camera_angle_x is not None:
+                focal = W / (2 * np.tan(self.camera_angle_x / 2))
+            else:
+                focal = W / 2 
 
-            i, j = torch.meshgrid(torch.arange(W), torch.arange(H), indexing='xy')
-            i = i.reshape(-1)
-            j = j.reshape(-1)
-
-            indices = torch.randint(0, H * W, (N_rays,))
-            i = i[indices]
-            j = j[indices]
+            i = torch.randint(0, W, (N_rays,))
+            j = torch.randint(0, H, (N_rays,))
+            
             rgb_gt = image[:, j, i].permute(1, 0)  # [N_rays, 3]
 
-            x = (i - W * 0.5) / focal
-            y = (j - H * 0.5) / focal
+            x = (i.float() - W * 0.5) / focal
+            y = (j.float() - H * 0.5) / focal
             z = -torch.ones_like(x)
             dirs = torch.stack([x, y, z], dim=-1)  # [N_rays, 3]
 
@@ -113,12 +114,13 @@ class LoadSyntheticDataset(Dataset):
             near, far = 2.0, 6.0
             t_vals = torch.linspace(0., 1., steps=64)
             z_vals = near * (1. - t_vals) + far * t_vals  # [64]
-            z_vals = z_vals.expand(N_rays, -1)
+            z_vals = z_vals.expand(N_rays, -1)  # [N_rays, 64]
 
             mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
             upper = torch.cat([mids, z_vals[..., -1:]], -1)
             lower = torch.cat([z_vals[..., :1], mids], -1)
-            z_vals = lower + (upper - lower) * torch.rand_like(z_vals)
+            t_rand = torch.rand_like(z_vals)
+            z_vals = lower + (upper - lower) * t_rand
 
             points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # [N_rays, 64, 3]
 

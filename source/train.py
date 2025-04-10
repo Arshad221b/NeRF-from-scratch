@@ -15,110 +15,137 @@ import numpy as np
 class TrainModel: 
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = NeRFModel().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4)
-        self.batch_size = 1
-
-        workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.model = NeRFModel(pos_freqs=10, dir_freqs=4, hidden_size=256).to(self.device)
         
+        self.optimizer = optim.Adam(self.model.parameters(), 
+                                  lr=1e-4,  # Lower initial learning rate
+                                  betas=(0.9, 0.999),
+                                  eps=1e-8)
+        
+        self.batch_size = 1
+        workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         base_path = os.path.join(workspace_root, 'nerf_synthetic', 'chair')
-        data_path = os.path.join(base_path, 'train')  # Path to images
+        data_path = os.path.join(base_path, 'train')
         transforms_path = os.path.join(base_path, 'transforms_train.json')
         
         self.dataloader = CustomDataloader(self.batch_size, data_path, transforms_path)
-        self.epochs = 1000
+        self.epochs = 200
+
+        self.mse_loss = nn.MSELoss()
         
-        self.loss_function = nn.MSELoss()
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.1)
+
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.995)
+        
         self.start_epoch = 0
-        self.checkpoint_path = 'checkpoint.pth'
+        self.best_loss = float('inf')
+        self.running_loss = []
+        self.window_size = 100
 
-    #ChatGPT Generated Function
-    def volume_rendering(self, outputs, z_vals, rays_d):
-        rgb = outputs[..., :3]                  # [B, N, 3]
-        sigma = outputs[..., 3]                 # [B, N]
-        sigma = torch.clamp(sigma, min=0.0, max=10.0)
-        # Compute distances between z samples
-        dists = z_vals[..., 1:] - z_vals[..., :-1]  # [B, N-1]
-        last_dist = 1e10 * torch.ones_like(dists[..., :1])  # [B, 1]
-        dists = torch.cat([dists, last_dist], dim=-1)       # [B, N]
-
-        # Scale by ray direction magnitude
-        dists = dists * torch.norm(rays_d[..., None, :], dim=-1)  # [B, N]
-
-        # Volume rendering steps
-        alpha = 1.0 - torch.exp(-sigma * dists)  # [B, N]
-        transmittance = torch.cumprod(
-            torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
-            dim=-1
-        )[..., :-1]
-        weights = alpha * transmittance  # [B, N]
-
-        # RGB + Depth
-        rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)  # [B, 3]
-        depth_map = torch.sum(weights * z_vals, dim=-1)        # [B]
-
-        return rgb_map, depth_map
-    
     def train(self):
         try:
             torch.cuda.empty_cache()
+            
             for epoch in range(self.start_epoch, self.epochs):
+                epoch_loss = 0.0
+                batch_count = 0
+                
                 for i, data in enumerate(self.dataloader):
                     try:
-                        for key, value in data.items():
-                            data[key] = value.to(self.device)
-
                         points = data['points'].to(self.device)
                         rays_d = data['rays_d'].to(self.device)
                         z_vals = data['z_vals'].to(self.device)
                         rgb_gt = data['rgb_gt'].to(self.device)
                         
-                        batch_size = points.shape[0]
-                        
-                        if rays_d.shape[0] != batch_size:
-                            rays_d = rays_d[:batch_size]
-                        
-                        if z_vals.shape[0] != batch_size:
-                            z_vals = z_vals[:batch_size]
-                        
-                        if rgb_gt.shape[0] != batch_size:
-                            rgb_gt = rgb_gt[:batch_size]
-                        
-                        if points.shape[1] != z_vals.shape[1]:
-                            min_samples = min(points.shape[1], z_vals.shape[1])
-                            points = points[:, :min_samples, :]
-                            z_vals = z_vals[:, :min_samples]
+                        batch_size, n_rays, n_samples = points.shape[0], points.shape[1], points.shape[2]
+                        chunk_size = 2048  # Reduced chunk size
+                        rgb_pred = torch.zeros((batch_size, n_rays, 3), device=self.device)
                         
                         self.optimizer.zero_grad()
-                        outputs = self.model(points)
                         
-                        rgb_pred, depth_pred = self.volume_rendering(outputs, z_vals, rays_d)
-                        loss = self.loss_function(rgb_pred, rgb_gt)
+                        for chunk_start in range(0, n_rays, chunk_size):
+                            chunk_end = min(chunk_start + chunk_size, n_rays)
+                            
+
+                            points_chunk = points[:, chunk_start:chunk_end].reshape(-1, n_samples, 3)
+                            rays_d_chunk = rays_d[:, chunk_start:chunk_end].reshape(-1, 3)
+                            z_vals_chunk = z_vals[:, chunk_start:chunk_end].reshape(-1, n_samples)
+                            
+
+                            rays_d_norm = F.normalize(rays_d_chunk, dim=-1)
+ 
+                            points_flat = points_chunk.reshape(-1, 3)
+                            dirs_flat = rays_d_norm.unsqueeze(1).expand(-1, n_samples, -1).reshape(-1, 3)
+                            
+                            outputs = self.model(points_flat, dirs_flat)
+                            outputs = outputs.reshape(-1, n_samples, 4)
+                            
+                            rgb = outputs[..., :3]
+                            sigma = outputs[..., 3]
+                            
+                            dists = z_vals_chunk[..., 1:] - z_vals_chunk[..., :-1]
+                            dists = torch.cat([dists, torch.ones_like(dists[..., :1]) * 1e10], dim=-1)
+                            
+                            alpha = 1 - torch.exp(-F.relu(sigma) * dists)
+                            T = torch.cumprod(torch.cat([
+                                torch.ones_like(alpha[..., :1]),
+                                (1 - alpha + 1e-10)[..., :-1]
+                            ], dim=-1), dim=-1)
+                            
+                            weights = alpha * T
+                            rgb_chunk = (weights.unsqueeze(-1) * rgb).sum(dim=1)
+
+                            rgb_pred[:, chunk_start:chunk_end] = rgb_chunk.reshape(batch_size, -1, 3)
+
+                        loss = self.mse_loss(rgb_pred, rgb_gt)
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+  
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+                        
                         self.optimizer.step()
 
-                        if i % 100 == 0:
-                            print(f'Epoch [{epoch}/{self.epochs}], Step [{i}/{len(self.dataloader)}], Loss: {loss.item():.4f}')
+                        epoch_loss += loss.item()
+                        batch_count += 1
+                        
+                        self.running_loss.append(loss.item())
+                        if len(self.running_loss) > self.window_size:
+                            self.running_loss.pop(0)
+                        
+                        if i % 10 == 0:
+                            avg_loss = sum(self.running_loss) / len(self.running_loss)
+                            print(f'Epoch [{epoch}/{self.epochs}], Step [{i}], Loss: {avg_loss:.6f}')
+                        
+                        # Clear memory
+                        del points, rays_d, z_vals, rgb_gt, rgb_pred, outputs
+                        torch.cuda.empty_cache()
+                            
                     except Exception as e:
                         print(f"Error in batch {i}: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
                         continue
 
                 self.scheduler.step()
+                
+                avg_loss = epoch_loss / batch_count
 
-                if (epoch + 1) % 10 == 0:
-                    torch.save(self.model.state_dict(), self.checkpoint_path)
-                    print(f'Model saved to {self.checkpoint_path}')
-            print('Training complete.')
+                if avg_loss < self.best_loss:
+                    self.best_loss = avg_loss
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'loss': avg_loss,
+                    }, 'best_checkpoint.pth')
+
+                if (epoch + 1) % 50 == 0:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'loss': avg_loss,
+                    }, f'checkpoint_epoch_{epoch+1}.pth')
+            
         except Exception as e:
-            print(f"Error during training: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        # self.model.eval()   
-
+            print(f"Training error: {str(e)}")
+            
 if __name__ == "__main__":
     train_model = TrainModel()
     train_model.train()
