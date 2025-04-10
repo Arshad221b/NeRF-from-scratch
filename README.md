@@ -105,18 +105,6 @@ nerf_synthetic/
 - Gradient clipping for training stability
 - Regular checkpointing for experiment tracking
 
-# NeRF from Scratch
-
-A PyTorch implementation of Neural Radiance Fields (NeRF) built from scratch. This implementation focuses on learning and understanding the core concepts of NeRF while maintaining good performance and code readability.
-
-## Overview
-
-Neural Radiance Fields (NeRF) represent scenes as continuous 5D functions that output the radiance emitted in each direction (θ, φ) at each point (x, y, z) in space. This implementation includes:
-
-- Custom NeRF model with positional encoding
-- Volume rendering pipeline
-- Training on synthetic datasets
-- Inference with novel view synthesis
 
 ## Technical Challenges & Learning Experience
 
