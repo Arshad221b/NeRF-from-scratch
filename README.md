@@ -187,7 +187,7 @@ Neural Radiance Fields (NeRF) represent scenes as continuous 5D functions that o
 This implementation has been tested on:
 - NVIDIA T4 GPU
 - Training time: ~3 hours for 200 epochs on the chair dataset (for 400 epochs, took around 5-6 hrs)
-- Inference time: ~2-3 minutes for rendering a complete 360° view
+- Inference time: ~2-3 seconds/image for rendering a complete 360° view
 
 Note: Performance can vary based on:
 - Scene complexity
