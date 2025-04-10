@@ -54,7 +54,7 @@ python source/train.py
 Training parameters:
 - Learning rate: 1e-4 with exponential decay (gamma=0.995)
 - Batch size: 1 (processes multiple rays per batch)
-- Number of epochs: 200
+- Number of epochs: 200 * 2 (trainning best checkpoint again for 200 epochs)
 - Positional encoding frequencies: 10 (positions), 4 (directions)
 - Network size: 256 hidden units
 
@@ -186,7 +186,7 @@ Neural Radiance Fields (NeRF) represent scenes as continuous 5D functions that o
 
 This implementation has been tested on:
 - NVIDIA T4 GPU
-- Training time: ~3 hours for 200 epochs on the chair dataset
+- Training time: ~3 hours for 200 epochs on the chair dataset (for 400 epochs, took around 5-6 hrs)
 - Inference time: ~2-3 minutes for rendering a complete 360° view
 
 Note: Performance can vary based on:
